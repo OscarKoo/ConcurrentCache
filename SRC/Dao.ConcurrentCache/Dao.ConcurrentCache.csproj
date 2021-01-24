@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>NET45;</TargetFrameworks>
+    <Authors>Oscar Koo</Authors>
+    <Description>A thread-safe, concurrent, expirable, async cache</Description>
+    <Copyright>Copyright 2021 Oscar Koo</Copyright>
+    <PackageLicenseUrl>https://github.com/OscarKoo/ConcurrentCache/blob/main/LICENSE</PackageLicenseUrl>
+    <PackageProjectUrl>https://github.com/OscarKoo/ConcurrentCache</PackageProjectUrl>
+    <PackageIconUrl>https://raw.githubusercontent.com/OscarKoo/ConcurrentCache/main/favicon.ico</PackageIconUrl>
+    <PackageTags>A thread-safe, concurrent, expirable, async cache</PackageTags>
+    <PackageReleaseNotes>Visit the project's url to see the Release Notes</PackageReleaseNotes>
+    <Company>Oscar Koo</Company>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <Version>1.0.0.0</Version>
+    <PackageId>Dao.ConcurrentCache</PackageId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Dao.ConcurrentDictionaryLazy" Version="1.2.0" />
+    <PackageReference Include="Nito.AsyncEx" Version="4.0.1" />
+  </ItemGroup>
+
+</Project>
