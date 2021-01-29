@@ -114,6 +114,12 @@ namespace Dao.ConcurrentCache
 
         bool HasCache(CacheEntry<TValue> entry, DateTime now, out CacheObject<TValue> value)
         {
+            if (entry.Entry == null)
+            {
+                value = null;
+                return false;
+            }
+
             var cacheObj = entry.Entry as ExpirableCacheObject<TValue>;
 
             if (cacheObj != null)
