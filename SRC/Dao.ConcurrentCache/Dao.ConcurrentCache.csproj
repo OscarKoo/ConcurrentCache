@@ -1,7 +1,7 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFrameworks>NET45;</TargetFrameworks>
+    <TargetFrameworks>NETSTANDARD2.0;NET45;NETCOREAPP2.0;</TargetFrameworks>
     <Authors>Oscar Koo</Authors>
     <Description>A thread-safe, concurrent, expirable, async cache</Description>
     <Copyright>Copyright 2021 Oscar Koo</Copyright>
@@ -12,13 +12,13 @@
     <PackageReleaseNotes>Visit the project's url to see the Release Notes</PackageReleaseNotes>
     <Company>Oscar Koo</Company>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
-    <Version>1.0.1.0</Version>
+    <Version>2.0.0.0</Version>
     <PackageId>Dao.ConcurrentCache</PackageId>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Dao.ConcurrentDictionaryLazy" Version="1.2.0" />
-    <PackageReference Include="Nito.AsyncEx" Version="4.0.1" />
+    <PackageReference Include="Dao.IndividualLock" Version="3.0.5" />
+    <PackageReference Include="Dao.QueueExecutor" Version="1.0.5" />
   </ItemGroup>
 
 </Project>

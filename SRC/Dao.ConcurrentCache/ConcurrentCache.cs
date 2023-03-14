@@ -1,329 +1,307 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
-using Dao.ConcurrentDictionaryLazy;
+using Dao.IndividualLock;
+using Dao.QueueExecutor;
 
 namespace Dao.ConcurrentCache
 {
-    public class ConcurrentCache<TKey, TValue>
+    public abstract class ConcurrentCache
     {
-        readonly ConcurrentDictionaryLazy<TKey, CacheEntry<TValue>> cache;
+        protected static readonly CacheSetting defaultSetting = new CacheSetting();
+        protected static readonly Task end = Task.FromResult(0);
+    }
 
-        readonly bool acceptDefaultValue;
-        readonly TimeSpan? absoluteExpiration;
-        readonly TimeSpan? relativeExpiration;
-        readonly TimeSpan? expiration;
+    public class ConcurrentCache<TKey, TValue> : ConcurrentCache
+    {
+        readonly ConcurrentDictionary<TKey, CacheEntry> cache;
+        readonly IndividualLocks<TKey> locks;
+        readonly Catcher catcher = new Catcher();
 
-        DateTime? lastExpirationCheck;
-        bool isExpirationChecking;
+        #region Setting
 
-        public ConcurrentCache(IEqualityComparer<TKey> comparer = null, bool acceptDefaultValue = true, TimeSpan? absoluteExpiration = null, TimeSpan? relativeExpiration = null)
+        readonly CacheSetting setting;
+
+        #endregion
+
+        #region Constructor
+
+        public ConcurrentCache() : this(null, null) { }
+
+        public ConcurrentCache(IEqualityComparer<TKey> comparer = null, bool acceptDefaultValue = true, TimeSpan? absoluteExpiration = null, TimeSpan? relativeExpiration = null) : this(comparer, new CacheSetting
         {
-            if (comparer == null)
-                comparer = EqualityComparer<TKey>.Default;
+            AcceptDefaultValue = acceptDefaultValue,
+            AbsoluteExpiration = absoluteExpiration,
+            RelativeExpiration = relativeExpiration
+        }) { }
 
-            this.cache = new ConcurrentDictionaryLazy<TKey, CacheEntry<TValue>>(comparer);
-
-            this.acceptDefaultValue = acceptDefaultValue;
-            this.absoluteExpiration = absoluteExpiration;
-            this.relativeExpiration = relativeExpiration;
-            this.expiration = new[] { absoluteExpiration, relativeExpiration }.Min();
-        }
-
-        #region ExpirationCheck
-
-        void ExpirationCheck()
+        public ConcurrentCache(IEqualityComparer<TKey> comparer = null, CacheSetting setting = null)
         {
-            if (this.expiration == null)
-                return;
+            comparer = comparer ?? EqualityComparer<TKey>.Default;
+            this.setting = setting ?? defaultSetting;
 
-            var expirationMS = this.expiration.Value.TotalMilliseconds;
-            if (expirationMS <= 0)
-                return;
-
-            var now = DateTime.Now;
-
-            // 轮询间隔为过期时间的一半, 最少1秒, 最多1天
-            var checkInterval = Math.Min(86400000, Math.Max(1000, expirationMS / 10));
-
-            if (!RequireExpirationCheck(checkInterval, now))
-                return;
-
-            lock (this.cache)
-            {
-                if (!RequireExpirationCheck(checkInterval, now))
-                    return;
-
-                this.isExpirationChecking = true;
-
-                var keys = this.cache.Keys;
-
-                keys.ParallelForEach(key =>
-                {
-                    CacheEntry<TValue> value;
-
-                    if (!this.cache.TryGetValue(key, out value))
-                        return;
-
-                    var cacheObj = value.Entry as ExpirableCacheObject<TValue>;
-                    if (cacheObj == null)
-                        return;
-
-                    if (cacheObj.AbsoluteExpiration != null && cacheObj.AbsoluteExpiration.Value < now
-                        || cacheObj.RelativeExpiration != null && cacheObj.RelativeExpiration.Value < now)
-                    {
-                        this.cache.Remove(key);
-                    }
-                });
-
-                this.lastExpirationCheck = now;
-                this.isExpirationChecking = false;
-            }
-        }
-
-        bool RequireExpirationCheck(double checkInterval, DateTime now)
-        {
-            return !this.isExpirationChecking && (this.lastExpirationCheck == null || this.lastExpirationCheck.Value.AddMilliseconds(checkInterval) < now);
+            this.cache = new ConcurrentDictionary<TKey, CacheEntry>(comparer);
+            this.locks = new IndividualLocks<TKey>(comparer);
+            this.catcher.Catch += CheckExpiration;
         }
 
         #endregion
 
-        #region GetOrAdd
+        #region CheckExpiration
 
-        public TValue GetOrAdd(TKey key, Func<TKey, TValue> valueFactory)
+        void TriggerCheckExpiration()
         {
-            var entry = GetEntry(key);
-
-            var checkPoint = DateTime.Now;
-            CacheObject<TValue> cacheObj;
-            if (!HasCache(entry, checkPoint, out cacheObj))
-            {
-                cacheObj = AddOrUpdate(true, entry, key, checkPoint, valueFactory);
-            }
-
-            Task.Run((Action)ExpirationCheck);
-
-            return cacheObj.Data;
-        }
-
-        CacheEntry<TValue> GetEntry(TKey key)
-        {
-            return this.cache.GetOrAdd(key, k => new CacheEntry<TValue>());
-        }
-
-        bool HasCache(CacheEntry<TValue> entry, DateTime now, out CacheObject<TValue> value)
-        {
-            if (entry.Entry == null)
-            {
-                value = null;
-                return false;
-            }
-
-            var cacheObj = entry.Entry as ExpirableCacheObject<TValue>;
-
-            if (cacheObj != null)
-            {
-                if (cacheObj.AbsoluteExpiration != null && cacheObj.AbsoluteExpiration < now
-                    || cacheObj.RelativeExpiration != null && cacheObj.RelativeExpiration < now)
-                {
-                    value = null;
-                    return false;
-                }
-
-                cacheObj.AccessTime = DateTime.Now;
-                RefreshRelativeExpiration(cacheObj);
-            }
-
-            value = entry.Entry;
-            return true;
-        }
-
-        void RefreshRelativeExpiration(ExpirableCacheObject<TValue> cacheObj)
-        {
-            if (this.relativeExpiration != null)
-                cacheObj.RelativeExpiration = cacheObj.AccessTime.AddMilliseconds(this.relativeExpiration.Value.TotalMilliseconds);
-        }
-
-        CacheObject<TValue> AddOrUpdate(bool requireCheck, CacheEntry<TValue> entry, TKey key, DateTime checkPoint, Func<TKey, TValue> valueFactory)
-        {
-            CacheObject<TValue> cacheObj;
-            using (entry.Locker.Lock())
-            {
-                if (requireCheck && HasCache(entry, checkPoint, out cacheObj))
-                    return cacheObj;
-
-                entry.Entry = null;
-
-                cacheObj = this.expiration == null
-                    ? new CacheObject<TValue>()
-                    : new ExpirableCacheObject<TValue>();
-
-                try
-                {
-                    var value = valueFactory(key);
-                    SetValue(entry, cacheObj, value);
-                }
-                catch (Exception ex) { }
-            }
-
-            return cacheObj;
-        }
-
-        void SetValue(CacheEntry<TValue> entry, CacheObject<TValue> cacheObj, TValue value)
-        {
-            cacheObj.Data = value;
-
-            if (!this.acceptDefaultValue && Equals(value, default(TValue)))
+            if (!ShouldCheck(DateTime.UtcNow))
                 return;
 
-            ExpirableCacheObject<TValue> expirableCacheObject;
-            if (this.expiration != null
-                && (expirableCacheObject = cacheObj as ExpirableCacheObject<TValue>) != null)
-            {
-                if (this.absoluteExpiration != null && expirableCacheObject.AbsoluteExpiration == null)
-                    expirableCacheObject.AbsoluteExpiration = expirableCacheObject.CreateTime.AddMilliseconds(this.absoluteExpiration.Value.TotalMilliseconds);
-
-                RefreshRelativeExpiration(expirableCacheObject);
-            }
-
-            entry.Entry = cacheObj;
+            this.catcher.Throw();
         }
 
-        public async Task<TValue> GetOrAddAsync(TKey key, Func<TKey, Task<TValue>> valueFactory)
+        DateTime lastCheck;
+
+        bool ShouldCheck(DateTime now) => !this.setting.IsPermanent && this.lastCheck.AddMilliseconds(this.setting.Interval) <= now;
+
+        Task CheckExpiration()
         {
-            var entry = GetEntry(key);
+            var now = DateTime.UtcNow;
+            if (!ShouldCheck(now))
+                return end;
 
-            var checkPoint = DateTime.Now;
-            CacheObject<TValue> cacheObj;
-            if (!HasCache(entry, checkPoint, out cacheObj))
-            {
-                cacheObj = await AddOrUpdateAsync(true, entry, key, checkPoint, valueFactory);
-            }
+            var values = this.cache.Values.Where(w => w.IsExpired(this.setting, now)).ToList();
+            values.ParallelForEach(entry => this.cache.TryRemove(entry.Key, out _));
 
-            Task.Run((Action)ExpirationCheck);
-
-            return cacheObj.Data;
-        }
-
-        async Task<CacheObject<TValue>> AddOrUpdateAsync(bool requireCheck, CacheEntry<TValue> entry, TKey key, DateTime checkPoint, Func<TKey, Task<TValue>> valueFactory)
-        {
-            CacheObject<TValue> cacheObj;
-            using (await entry.Locker.LockAsync())
-            {
-                if (requireCheck && HasCache(entry, checkPoint, out cacheObj))
-                    return cacheObj;
-
-                entry.Entry = null;
-
-                cacheObj = this.expiration == null
-                    ? new CacheObject<TValue>()
-                    : new ExpirableCacheObject<TValue>();
-
-                try
-                {
-                    var value = await valueFactory(key);
-                    SetValue(entry, cacheObj, value);
-                }
-                catch (Exception ex) { }
-            }
-
-            return cacheObj;
+            this.lastCheck = DateTime.UtcNow;
+            return end;
         }
 
         #endregion
 
-        #region TryGet/Update
+        #region publics
 
-        /// <summary>
-        /// Possible return default(<see cref="TValue"/>) value
-        /// </summary>
-        /// <param name="key"></param>
-        /// <returns></returns>
-        public TValue GetValue(TKey key)
+        public TValue Get(TKey key)
         {
-            CacheEntry<TValue> entry;
-            CacheObject<TValue> cacheObj;
-
-            return TryGetValue(key, false, out entry, out cacheObj)
-                ? cacheObj.Data
-                : default(TValue);
+            try
+            {
+                GetInternal(key, DateTime.UtcNow, out var value);
+                return value;
+            }
+            finally
+            {
+                TriggerCheckExpiration();
+            }
         }
 
-        bool TryGetValue(TKey key, bool createKey, out CacheEntry<TValue> entry, out CacheObject<TValue> cacheObj)
+        public bool Get(TKey key, out TValue value)
         {
-            if (this.cache.TryGetValue(key, out entry))
+            try
             {
-                if (HasCache(entry, DateTime.Now, out cacheObj))
-                    return true;
+                return GetInternal(key, DateTime.UtcNow, out value);
             }
-            else
+            finally
             {
-                if (createKey)
-                    entry = GetEntry(key);
+                TriggerCheckExpiration();
             }
+        }
 
-            cacheObj = null;
+        bool GetInternal(TKey key, DateTime now, out TValue value)
+        {
+            if (this.cache.TryGetValue(key, out var entry))
+                return GetCacheValue(entry, now, out value);
+
+            value = default;
             return false;
         }
 
-        public void UpdateValue(TKey key, Func<TKey, TValue, TValue> updateFactory, Func<TKey, TValue> addFactory = null)
+        bool GetCacheValue(CacheEntry entry, DateTime now, out TValue value)
         {
-            CacheEntry<TValue> entry;
-            CacheObject<TValue> cacheObj;
-
-            var hasCache = TryGetValue(key, true, out entry, out cacheObj);
-            if (!hasCache && addFactory == null)
-                return;
-
-            AddOrUpdate(false, entry, key, DateTime.Now, k => !hasCache ? addFactory(k) : updateFactory(key, cacheObj.Data));
-
-            Task.Run((Action)ExpirationCheck);
-        }
-
-        public async Task UpdateValueAsync(TKey key, Func<TKey, TValue, Task<TValue>> updateFactory, Func<TKey, Task<TValue>> addFactory = null)
-        {
-            CacheEntry<TValue> entry;
-            CacheObject<TValue> cacheObj;
-
-            var hasCache = TryGetValue(key, true, out entry, out cacheObj);
-            if (!hasCache && addFactory == null)
-                return;
-
-            await AddOrUpdateAsync(false, entry, key, DateTime.Now, async k => !hasCache ? await addFactory(k) : await updateFactory(key, cacheObj.Data));
-            
-            Task.Run((Action)ExpirationCheck);
-        }
-
-        #endregion
-
-        #region Keys/Values
-
-        public IEnumerable<TKey> Keys
-        {
-            get
+            if (entry == null || entry.IsExpired(this.setting, now))
             {
-                return this.cache
-                    .Where(w => w.Value.Entry != null)
-                    .Select(s => s.Key);
+                value = default;
+                if (entry != null)
+                    this.cache.TryRemove(entry.Key, out _);
+                return false;
+            }
+
+            value = entry.Value;
+            return true;
+        }
+
+        public TValue GetOrSet(TKey key, Func<TKey, TValue> valueFactory)
+        {
+            try
+            {
+                return valueFactory == null
+                    ? throw new ArgumentNullException(nameof(valueFactory))
+                    : GetInternal(key, DateTime.UtcNow, out var value)
+                        ? value
+                        : this.cache.GetOrAdd(key, k => new CacheEntry(k, WrapValueFactory(k, valueFactory))).Value;
+            }
+            finally
+            {
+                TriggerCheckExpiration();
             }
         }
 
-        public IEnumerable<TValue> Values
+        Func<TValue> WrapValueFactory(TKey key, Func<TKey, TValue> valueFactory)
         {
-            get
+            return () =>
             {
-                return this.cache.Values
-                    .Where(w => w.Entry != null)
-                    .Select(s => s.Entry.Data);
+                try
+                {
+                    var value = valueFactory(key);
+                    if (!this.setting.AcceptDefaultValue && EqualityComparer<TValue>.Default.Equals(value, default))
+                        this.cache.TryRemove(key, out _);
+                    return value;
+                }
+                catch (Exception)
+                {
+                    this.cache.TryRemove(key, out _);
+                    throw;
+                }
+            };
+        }
+
+        public async Task<TValue> GetOrSetAsync(TKey key, Func<TKey, Task<TValue>> valueFactoryAsync)
+        {
+            try
+            {
+                if (valueFactoryAsync == null)
+                    throw new ArgumentNullException(nameof(valueFactoryAsync));
+
+                if (GetInternal(key, DateTime.UtcNow, out var value))
+                    return value;
+
+                using (await this.locks.LockAsync(key).ConfigureAwait(false))
+                {
+                    if (this.cache.TryGetValue(key, out var entry))
+                        return entry.Value;
+
+                    value = await valueFactoryAsync(key).ConfigureAwait(false);
+                    return this.setting.AcceptDefaultValue || !EqualityComparer<TValue>.Default.Equals(value, default)
+                        ? this.cache.GetOrAdd(key, k => new CacheEntry(k, () => value)).Value
+                        : value;
+                }
+            }
+            finally
+            {
+                TriggerCheckExpiration();
             }
         }
 
-        #endregion
+        public TValue Set(TKey key, Func<TKey, TValue> valueFactory)
+        {
+            try
+            {
+                if (valueFactory == null)
+                    throw new ArgumentNullException(nameof(valueFactory));
+
+                var entry = new CacheEntry(key, WrapValueFactory(key, valueFactory));
+                this.cache[key] = entry;
+                return entry.Value;
+            }
+            finally
+            {
+                TriggerCheckExpiration();
+            }
+        }
+
+        public async Task<TValue> SetAsync(TKey key, Func<TKey, Task<TValue>> valueFactoryAsync)
+        {
+            try
+            {
+                if (valueFactoryAsync == null)
+                    throw new ArgumentNullException(nameof(valueFactoryAsync));
+
+                using (await this.locks.LockAsync(key).ConfigureAwait(false))
+                {
+                    var value = await valueFactoryAsync(key).ConfigureAwait(false);
+                    if (this.setting.AcceptDefaultValue || !EqualityComparer<TValue>.Default.Equals(value, default))
+                    {
+                        var entry = new CacheEntry(key, () => value);
+                        this.cache[key] = entry;
+                    }
+
+                    return value;
+                }
+            }
+            finally
+            {
+                TriggerCheckExpiration();
+            }
+        }
 
         public void Remove(TKey key)
         {
-            this.cache.Remove(key);
+            try
+            {
+                this.cache.TryRemove(key, out _);
+            }
+            finally
+            {
+                TriggerCheckExpiration();
+            }
         }
+
+        public ICollection<TKey> Keys
+        {
+            get
+            {
+                try
+                {
+                    return this.cache.Keys;
+                }
+                finally
+                {
+                    TriggerCheckExpiration();
+                }
+            }
+        }
+
+        public ICollection<TValue> Values
+        {
+            get
+            {
+                try
+                {
+                    return this.cache.Values.Select(s => s.Value).ToList().AsReadOnly();
+                }
+                finally
+                {
+                    TriggerCheckExpiration();
+                }
+            }
+        }
+
+        #endregion
+
+        #region CacheItem
+
+        class CacheEntry : Lazy<TValue>
+        {
+            public CacheEntry(TKey key, Func<TValue> valueFactory) : base(valueFactory) => Key = key;
+
+            internal TKey Key { get; }
+
+            internal new TValue Value
+            {
+                get
+                {
+                    AccessTime = DateTime.UtcNow;
+                    return base.Value;
+                }
+            }
+
+            DateTime CreateTime { get; } = DateTime.UtcNow;
+            DateTime AccessTime { get; set; } = DateTime.UtcNow;
+
+            internal bool IsExpired(CacheSetting setting, DateTime now) =>
+                !setting.IsPermanent
+                && ((setting.HasAbsoluteExpiration && CreateTime.AddMilliseconds(setting.AbsoluteExpiration.Value.TotalMilliseconds) <= now)
+                    || (setting.HasRelativeExpiration && AccessTime.AddMilliseconds(setting.RelativeExpiration.Value.TotalMilliseconds) <= now));
+        }
+
+        #endregion
     }
 }
